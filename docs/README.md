@@ -15,18 +15,19 @@
 
 | Модуль | Файл | Документ | Назначение |
 |--------|------|----------|------------|
-| **API-сервис** | `main.py` | [main.md](modules/main.md) | FastAPI-монолит: эндпоинты `POST /process`, `GET /metrics`, `POST /v1/chat/completions`; StateStore, блокировки, метрики, selftest. |
+| **API-сервис** | `main.py` | [main.md](modules/main.md) | FastAPI-монолит: эндпоинты `POST /process`, `GET /metrics`, `POST /v1/chat/completions`; метрики, selftest. |
 | **Детекторы ПД** | `detectors.py` | [detectors.md](modules/detectors.md) | Регэксп-детекторы всех типов ПД, разрешение пересечений, маскирование/токенизация, безопасное логирование. |
+| **Хранилище** | `store.py` | — | SQLite-хранилище записей (общее для нескольких воркеров): WAL, TTL, атомарные операции, in-memory кэш. |
 | **Конфигурация** | `config.json` | [config.md](modules/config.md) | Список систем, типы ПД по системам, флаг демаскирования. |
 | **Нагрузочный тест** | `loadtest.py` | [loadtest.md](modules/loadtest.md) | Эмуляция проверяющей системы: RPS, p50/p95/p99, корректность. |
-| **Бенчмарк** | `bench.py` | — | Измерение предела 1 воркера на разнообразном датасете (24 кейса). |
+| **Бенчмарк** | `bench.py` | — | Измерение производительности на разнообразном датасете (24 кейса). |
 
 ### Вспомогательные файлы
 
 | Файл | Назначение |
 |------|-----------|
 | `requirements.txt` | Зависимости: `fastapi`, `uvicorn`, `pydantic`. |
-| `Dockerfile` | Контейнеризация сервиса. |
+| `Dockerfile` | Контейнеризация сервиса (4 воркера по умолчанию). |
 | `pack.sh` | Сборка `solution.zip` для сдачи. |
 | `recon.py` | Разведочный скрипт для пробы удалённого эндпоинта. |
 
@@ -35,11 +36,15 @@
 ```bash
 pip install -r requirements.txt
 python main.py --selftest        # проверка корректности
-python main.py                   # запуск сервера на :8000
+python main.py                   # запуск сервера на :8000 (4 воркера)
 python loadtest.py               # нагрузочный тест (6 простых кейсов)
 python bench.py                  # бенчмарк на разнообразном датасете (24 кейса)
 bash pack.sh                     # сборка solution.zip
 ```
+
+Переменные окружения:
+- `DB_PATH` — путь к SQLite-файлу (по умолчанию `state.db`);
+- `WORKERS` — число воркеров uvicorn (по умолчанию `4`).
 
 ## Контракт POST /process
 

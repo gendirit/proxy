@@ -29,3 +29,8 @@ technical specification/
 
 # Логи
 *.log
+
+# SQLite (runtime-данные)
+*.db
+*.db-wal
+*.db-shm

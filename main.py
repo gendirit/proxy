@@ -21,7 +21,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sys
+import tempfile
 import time
 from collections import OrderedDict
 from typing import Optional
@@ -31,6 +33,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from detectors import mask_payload, redact_for_logging, detect_spans, apply_spans
+from store import SQLiteStore
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -43,6 +46,10 @@ PROCESS_TIMEOUT = 8.0
 LARGE_TEXT_THRESHOLD = 20000
 
 CONFIG_PATH = "config.json"
+
+# Переменные окружения для многопроцессного запуска
+DB_PATH = os.environ.get("DB_PATH", "state.db")
+WORKERS = int(os.environ.get("WORKERS", "4"))
 
 _DEFAULT_SYSTEM = {
     "enabled": True,
@@ -112,62 +119,9 @@ def _log_json(**fields) -> None:
 
 
 # ---------------------------------------------------------------------------
-# State Store (in-memory)
+# State Store (SQLite, общее хранилище для нескольких воркеров)
+# Реализация в store.py (класс SQLiteStore).
 # ---------------------------------------------------------------------------
-
-
-class StateStore:
-    """In-memory хранилище записей с TTL и LRU-эвакуацией.
-
-    Один процесс, один воркер Uvicorn. Не потокобезопасен для нескольких
-    процессов — это допустимо, т.к. запуск строго в 1 воркер.
-    """
-
-    def __init__(self, ttl: int = TTL_SECONDS, max_records: int = MAX_RECORDS):
-        self._ttl = ttl
-        self._max_records = max_records
-        self._records: "OrderedDict[str, dict]" = OrderedDict()
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._locks_guard = asyncio.Lock()
-
-    def _now(self) -> float:
-        return time.time()
-
-    def _purge_expired(self) -> None:
-        now = self._now()
-        expired = [k for k, v in self._records.items() if v["expires_at"] <= now]
-        for k in expired:
-            self._records.pop(k, None)
-
-    def _evict_if_needed(self) -> None:
-        while len(self._records) > self._max_records:
-            self._records.popitem(last=False)
-
-    def get(self, payload_id: str) -> Optional[dict]:
-        self._purge_expired()
-        record = self._records.get(payload_id)
-        if record is None:
-            return None
-        if record["expires_at"] <= self._now():
-            self._records.pop(payload_id, None)
-            return None
-        # Обновляем порядок (LRU)
-        self._records.move_to_end(payload_id)
-        return record
-
-    def put(self, payload_id: str, record: dict) -> None:
-        self._purge_expired()
-        self._records[payload_id] = record
-        self._records.move_to_end(payload_id)
-        self._evict_if_needed()
-
-    async def get_lock(self, payload_id: str) -> asyncio.Lock:
-        async with self._locks_guard:
-            lock = self._locks.get(payload_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._locks[payload_id] = lock
-            return lock
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +234,7 @@ class ProcessService:
 
     async def _process_locked(self, payload: str, payload_id: str) -> tuple[str, list[str], str]:
         # Повторная проверка после получения блокировки (double-check)
-        record = self._store.get(payload_id)
+        record = await self._store.get(payload_id)
 
         if record is None:
             # Новый payload_id: маскируем, сохраняем, возвращаем маску
@@ -308,8 +262,15 @@ class ProcessService:
                 "created_at": now,
                 "expires_at": now + TTL_SECONDS,
             }
-            self._store.put(payload_id, new_record)
-            return masked, detected, "mask"
+            # Атомарная вставка: если запись уже создана другим воркером,
+            # insert_if_absent вернёт False — читаем существующую запись.
+            created = await self._store.insert_if_absent(payload_id, new_record)
+            if created:
+                return masked, detected, "mask"
+            record = await self._store.get(payload_id)
+            if record is None:
+                # Редкий случай: запись удалена между операциями — повторяем маскирование
+                return masked, detected, "mask"
 
         # Запись есть — определяем направление по хэшу
         payload_hash = _sha256(payload)
@@ -396,16 +357,61 @@ def _metric_add_detected(types: list) -> None:
         _metric_inc("process_detected_total", 1, t)
 
 
+def _metric_flatten() -> dict:
+    """Преобразует вложенные метрики в плоский словарь для SQLite."""
+    flat = {}
+    for name, value in _metrics.items():
+        if isinstance(value, dict):
+            for label, count in value.items():
+                flat["%s|%s" % (name, label)] = count
+        else:
+            flat[name] = value
+    return flat
+
+
+def _flush_metrics() -> None:
+    """Сбрасывает in-memory метрики в SQLite и обнуляет локальные."""
+    flat = _metric_flatten()
+    if not flat:
+        return
+    _store.flush_metrics(flat)
+    # Обнуляем локальные счётчики (после сброса)
+    for name in list(_metrics.keys()):
+        if isinstance(_metrics[name], dict):
+            _metrics[name] = {}
+        else:
+            _metrics[name] = 0
+
+
+async def _metrics_flush_loop() -> None:
+    """Фоновая задача: периодический сброс метрик в SQLite (раз в 1 сек)."""
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            async with _metrics_lock:
+                _flush_metrics()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _render_metrics() -> str:
+    """Рендерит метрики в Prometheus-формат из SQLite (агрегированные)."""
+    data = _store.read_metrics()
     lines = []
-    for status, count in sorted(_metrics["process_requests_total"].items()):
-        lines.append("process_requests_total{status=\"" + str(status) + "\"} " + str(count))
-    lines.append("process_latency_seconds_sum " + str(_metrics["process_latency_seconds_sum"]))
-    lines.append("process_latency_seconds_count " + str(_metrics["process_latency_seconds_count"]))
-    for t, count in sorted(_metrics["process_detected_total"].items()):
-        lines.append("process_detected_total{type=\"" + str(t) + "\"} " + str(count))
-    lines.append("process_429_total " + str(_metrics["process_429_total"]))
-    lines.append("process_tokens_total " + str(_metrics["process_tokens_total"]))
+    # process_requests_total{status="200"}
+    for key, count in sorted(data.items()):
+        if key.startswith("process_requests_total|"):
+            status = key.split("|", 1)[1]
+            lines.append("process_requests_total{status=\"" + status + "\"} " + str(int(count)))
+    # process_detected_total{type="FIO"}
+    for key, count in sorted(data.items()):
+        if key.startswith("process_detected_total|"):
+            t = key.split("|", 1)[1]
+            lines.append("process_detected_total{type=\"" + t + "\"} " + str(int(count)))
+    lines.append("process_latency_seconds_sum " + str(data.get("process_latency_seconds_sum", 0)))
+    lines.append("process_latency_seconds_count " + str(int(data.get("process_latency_seconds_count", 0))))
+    lines.append("process_429_total " + str(int(data.get("process_429_total", 0))))
+    lines.append("process_tokens_total " + str(int(data.get("process_tokens_total", 0))))
     return "\n".join(lines) + "\n"
 
 
@@ -414,9 +420,26 @@ def _render_metrics() -> str:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="PII Masking Service")
-_store = StateStore()
+_store = SQLiteStore(DB_PATH)
 _config = _load_config()
 _service = ProcessService(_store, _config.get("default_system", _DEFAULT_SYSTEM))
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    """Запускает фоновую задачу сброса метрик в SQLite."""
+    asyncio.create_task(_metrics_flush_loop())
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    """Сбрасывает метрики и закрывает хранилище."""
+    try:
+        async with _metrics_lock:
+            _flush_metrics()
+    except Exception:  # noqa: BLE001
+        pass
+    _store.close()
 
 
 @app.exception_handler(ProcessBusyError)
@@ -514,6 +537,7 @@ async def process_endpoint(request: Request):
 @app.get("/metrics")
 async def metrics_endpoint():
     async with _metrics_lock:
+        _flush_metrics()
         return Response(content=_render_metrics(), media_type="text/plain")
 
 
@@ -564,7 +588,9 @@ async def chat_completions(req: ChatRequest):
 
 
 async def _run_selftest() -> bool:
-    store = StateStore()
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    store = SQLiteStore(tmp.name)
     service = ProcessService(store)
     checks = []
 
@@ -619,13 +645,13 @@ async def _run_selftest() -> bool:
         f"got: {results[0]!r} vs {results[1]!r}",
     )
 
-    # 7. Запись не обновляется в спорном случае
+# 7. Запись не обновляется в спорном случае
     orig4 = "Сидоров Сидор Сидорович"
     await _proc(orig4, "p4")
-    rec_before = store.get("p4")
+    rec_before = await store.get("p4")
     # Присылаем несовпадающий payload (спорный случай)
     await _proc("Совершенно другой текст", "p4")
-    rec_after = store.get("p4")
+    rec_after = await store.get("p4")
     check(
         "record not updated on ambiguous",
         rec_before["original_text"] == rec_after["original_text"]
@@ -653,7 +679,7 @@ async def _run_selftest() -> bool:
         f"got: {r9b!r}",
     )
 
-    # 10. Один и тот же payload с разными payload_id возвращает одинаковую маску
+# 10. Один и тот же payload с разными payload_id возвращает одинаковую маску
     shared = "Кузнецов Кузьма Кузьмич, ИНН 7707083893"
     r10a, _, _ = await service.process(shared, "p10a")
     r10b, _, _ = await service.process(shared, "p10b")
@@ -662,6 +688,12 @@ async def _run_selftest() -> bool:
         r10a == r10b,
         f"got: {r10a!r} vs {r10b!r}",
     )
+
+    store.close()
+    try:
+        os.unlink(tmp.name)
+    except OSError:
+        pass
 
     return all(cond for _, cond in checks)
 
@@ -691,7 +723,8 @@ def main() -> None:
         sys.exit(_selftest())
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
+    # workers > 1 требует передавать приложение строкой импорта
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=WORKERS)
 
 
 if __name__ == "__main__":

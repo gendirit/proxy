@@ -37,13 +37,14 @@ FastAPI-монолит, реализующий контракт `POST /process` 
 
 ## Ключевые компоненты
 
-### `StateStore`
+### `SQLiteStore` (в `store.py`)
 
-In-memory хранилище записей с TTL и LRU-эвакуацией.
-- `TTL_SECONDS = 3600` — время жизни записи;
-- `MAX_RECORDS = 100000` — максимум записей;
-- хранит пары «оригинал ↔ маска» по `payload_id`;
-- блокировки на `payload_id` обеспечивают идемпотентность и защиту от гонок.
+Общее хранилище записей для нескольких воркеров uvicorn.
+- Таблица `records` (payload_id, original_text, masked_text, detected_types, TTL);
+- WAL-режим, `busy_timeout=10000`, `synchronous=OFF` — для конкурентной записи;
+- атомарные операции (`insert_if_absent` через `INSERT OR IGNORE`) — межпроцессная идемпотентность;
+- in-memory кэш записей (LRU) — ускоряет повторные чтения;
+- блокировки на `payload_id` (локальные `asyncio.Lock`) — защита от гонок в рамках процесса.
 
 ### `ProcessService`
 
@@ -51,6 +52,7 @@ In-memory хранилище записей с TTL и LRU-эвакуацией.
 - `_allowed_types()` — фильтрация типов ПД по конфигу системы;
 - `_allow_unmask()` — флаг разрешения демаскирования;
 - `process()` — блокировка на `payload_id`, определение направления, кэширование;
+- `_process_locked()` — атомарная вставка через `insert_if_absent` (идемпотентность между процессами);
 - `_run_mask()` — маскирование (для текстов > 2000 символов — в отдельном потоке через `asyncio.to_thread`).
 
 ### Метрики
@@ -85,9 +87,19 @@ In-memory хранилище записей с TTL и LRU-эвакуацией.
 ## Запуск
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+# 4 воркера (по умолчанию), SQLite-хранилище state.db
+python main.py
+
+# Явное указание числа воркеров и пути к БД
+DB_PATH=state.db WORKERS=4 python main.py
+
+# Selftest
 python main.py --selftest
 ```
+
+Переменные окружения:
+- `DB_PATH` — путь к SQLite-файлу (по умолчанию `state.db`);
+- `WORKERS` — число воркеров uvicorn (по умолчанию `4`).
 
 ## Зависимости
 
