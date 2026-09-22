@@ -55,6 +55,22 @@ _DATE_TEXT_WORD_RE = re.compile(
     r"(19\d{2}|20\d{2})",
     re.IGNORECASE,
 )
+# Объединённый регэксп дат (один проход вместо пяти)
+_DATE_ALL_RE = re.compile(
+    r"(?:"
+    r"\b(0?[1-9]|[12]\d|3[01])\s*[.\-/]\s*(0?[1-9]|1[0-2])\s*[.\-/]\s*(19\d{2}|20\d{2})\b|"
+    r"\b(19\d{2}|20\d{2})\s*[.\-/]\s*(0?[1-9]|1[0-2])\s*[.\-/]\s*(0?[1-9]|[12]\d|3[01])\b|"
+    r"\b(0?[1-9]|[12]\d|3[01])\s+(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*\s+(19\d{2}|20\d{2})|"
+    r"\b(19\d{2}|20\d{2})\s+год[ау]?\s*(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*\s+(0?[1-9]|[12]\d|3[01])|"
+    r"\b(?:первое|второе|третье|четвертое|пятое|шестое|седьмое|восьмое|девятое|десятое|"
+    r"одиннадцатое|двенадцатое|тринадцатое|четырнадцатое|пятнадцатое|шестнадцатое|"
+    r"семнадцатое|восемнадцатое|девятнадцатое|двадцатое|двадцать\s+первое|двадцать\s+второе|"
+    r"двадцать\s+третье|двадцать\s+четвертое|двадцать\s+пятое|двадцать\s+шестое|"
+    r"двадцать\s+седьмое|двадцать\s+восьмое|двадцать\s+девятое|тридцатое|тридцать\s+первое)\s+"
+    r"(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*\s+(19\d{2}|20\d{2})"
+    r")",
+    re.IGNORECASE,
+)
 
 _BIRTH_CTX_RE = re.compile(r"(?i:рожд|родил|урожен|дата\s+рождения|место\s+рождения)")
 _ISSUE_DATE_CTX_RE = re.compile(r"(?i:выдан|выдано|дата\s+выдачи)")
@@ -152,9 +168,17 @@ def resolve_overlaps(spans):
     return selected
 
 
-def _has_context(pattern: re.Pattern, text: str, start: int, end: int, window: int = 80) -> bool:
+def _has_context(pattern: re.Pattern, text: str, start: int, end: int, window: int = 80,
+                 cache: dict = None) -> bool:
     ctx_start = max(0, start - window)
     ctx_end = min(len(text), end + window)
+    if cache is not None:
+        key = (id(pattern), ctx_start, ctx_end)
+        if key in cache:
+            return cache[key]
+        result = pattern.search(text, ctx_start, ctx_end) is not None
+        cache[key] = result
+        return result
     return pattern.search(text, ctx_start, ctx_end) is not None
 
 
@@ -185,23 +209,29 @@ from re import error as _re_error  # noqa: E402  (для обработки ош
 def _detect(text: str):
     spans = []
     has_card = bool(_CARD_RE.search(text))
+    _ctx_cache = {}
+
+    # Быстрые признаки для раннего выхода из дорогих детекторов
+    has_digit = bool(re.search(r"\d", text))
+    has_upper = bool(re.search(r"[А-ЯЁA-Z]", text))
 
     # ФИО
-    for m in _FIO_RE.finditer(text):
-        full = m.group(0)
-        words = [w.lower() for w in full.split()]
-        if any(p in words for p in _PUBLIC_PERSONS):
-            continue
-        has_patr = any(_PATR_RE.search(w) for w in full.split())
-        has_ctx = _has_context(_FIO_DOC_CTX_RE, text, m.start(), m.end(), 120)
-        if not (has_patr or has_ctx):
-            continue
-        spans.append(Span(m.start(), m.end(), mask_value(full), 6, "FIO"))
+    if has_upper:
+        for m in _FIO_RE.finditer(text):
+            full = m.group(0)
+            words = [w.lower() for w in full.split()]
+            if any(p in words for p in _PUBLIC_PERSONS):
+                continue
+            has_patr = any(_PATR_RE.search(w) for w in full.split())
+            has_ctx = _has_context(_FIO_DOC_CTX_RE, text, m.start(), m.end(), 120, cache=_ctx_cache)
+            if not (has_patr or has_ctx):
+                continue
+            spans.append(Span(m.start(), m.end(), mask_value(full), 6, "FIO"))
 
-    # Место рождения
-    if _has_context(_BIRTH_CTX_RE, text, 0, len(text), len(text)):
+# Место рождения
+    if _has_context(_BIRTH_CTX_RE, text, 0, len(text), len(text), cache=_ctx_cache):
         for m in _PLACE_BIRTH_VALUE_RE.finditer(text):
-            if _has_context(_BIRTH_CTX_RE, text, m.start(), m.end(), 60):
+            if _has_context(_BIRTH_CTX_RE, text, m.start(), m.end(), 60, cache=_ctx_cache):
                 # Пропускаем, если рядом упоминается публичная личность
                 ctx = text[max(0, m.start() - 120):min(len(text), m.end() + 120)].lower()
                 if any(p in ctx for p in _PUBLIC_PERSONS):
@@ -209,8 +239,8 @@ def _detect(text: str):
                 spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 5, "PLACE_OF_BIRTH"))
 
     # Паспорт
-    dl_present = _has_context(_DL_CTX_RE, text, 0, len(text), len(text))
-    if not dl_present:
+    dl_present = _has_context(_DL_CTX_RE, text, 0, len(text), len(text), cache=_ctx_cache)
+    if has_digit and not dl_present:
         for m in _PASSPORT_LABELED_RE.finditer(text):
             spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 8, "PASSPORT"))
             spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 8, "PASSPORT"))
@@ -219,80 +249,88 @@ def _detect(text: str):
             inside = any(ls <= m.start() and m.end() <= le for ls, le in labeled_zones)
             if inside:
                 continue
-            if _has_context(_DEPT_CODE_CTX_RE, text, m.start(), m.end(), 60):
+            if _has_context(_DEPT_CODE_CTX_RE, text, m.start(), m.end(), 60, cache=_ctx_cache):
                 spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 8, "PASSPORT"))
                 spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 8, "PASSPORT"))
 
     # Код подразделения
-    for m in _DEPT_CODE_RE.finditer(text):
-        if _has_context(_DEPT_CODE_CTX_RE, text, m.start(), m.end(), 60):
-            spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 7, "DEPARTMENT_CODE"))
+    if has_digit:
+        for m in _DEPT_CODE_RE.finditer(text):
+            if _has_context(_DEPT_CODE_CTX_RE, text, m.start(), m.end(), 60, cache=_ctx_cache):
+                spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 7, "DEPARTMENT_CODE"))
 
     # Орган выдачи
     for m in _ISSUER_NAME_RE.finditer(text):
-        if _has_context(_DEPT_CODE_CTX_RE, text, m.start(), m.end(), 80):
+        if _has_context(_DEPT_CODE_CTX_RE, text, m.start(), m.end(), 80, cache=_ctx_cache):
             spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 5, "ISSUER"))
 
     # Даты
-    for pattern in (_DATE_NUM_RE, _DATE_NUM_REV_RE, _DATE_TEXT_RE, _DATE_TEXT_REV_RE, _DATE_TEXT_WORD_RE):
-        for m in pattern.finditer(text):
-            if _has_context(_ISSUE_DATE_CTX_RE, text, m.start(), m.end(), 60):
+    if has_digit:
+        for m in _DATE_ALL_RE.finditer(text):
+            if _has_context(_ISSUE_DATE_CTX_RE, text, m.start(), m.end(), 60, cache=_ctx_cache):
                 spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 6, "ISSUE_DATE"))
-            elif _has_context(_BIRTH_CTX_RE, text, m.start(), m.end(), 60):
+            elif _has_context(_BIRTH_CTX_RE, text, m.start(), m.end(), 60, cache=_ctx_cache):
                 spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 6, "BIRTH_DATE"))
 
-# Водительское удостоверение
-    if dl_present:
+    # Водительское удостоверение
+    if has_digit and dl_present:
         for m in _DL_RE.finditer(text):
-            if _has_context(_DL_CTX_RE, text, m.start(), m.end(), 80):
+            if _has_context(_DL_CTX_RE, text, m.start(), m.end(), 80, cache=_ctx_cache):
                 spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 5, "DRIVER_LICENSE"))
                 spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 5, "DRIVER_LICENSE"))
 
 # Адрес
-    for pattern, type_ in (
-        (_ADDR_CITY_RE, "ADDRESS"),
-        (_ADDR_STREET_RE, "ADDRESS"),
-    ):
-        for m in pattern.finditer(text):
-            spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 8, type_))
-    for pattern in (_ADDR_HOUSE_RE, _ADDR_APT_RE):
-        for m in pattern.finditer(text):
-            spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 8, "ADDRESS"))
-    for m in _ADDR_INDEX_RE.finditer(text):
-        if _has_context(_ADDR_INDEX_CTX_RE, text, m.start(), m.end(), 60):
-            spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 8, "ADDRESS"))
+    if has_upper:
+        for pattern, type_ in (
+            (_ADDR_CITY_RE, "ADDRESS"),
+            (_ADDR_STREET_RE, "ADDRESS"),
+        ):
+            for m in pattern.finditer(text):
+                spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 8, type_))
+        for pattern in (_ADDR_HOUSE_RE, _ADDR_APT_RE):
+            for m in pattern.finditer(text):
+                spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 8, "ADDRESS"))
+    if has_digit:
+        for m in _ADDR_INDEX_RE.finditer(text):
+            if _has_context(_ADDR_INDEX_CTX_RE, text, m.start(), m.end(), 60, cache=_ctx_cache):
+                spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 8, "ADDRESS"))
 
     # Гражданство
-    for m in _CITIZENSHIP_RE.finditer(text):
-        spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 8, "CITIZENSHIP"))
+    if has_upper:
+        for m in _CITIZENSHIP_RE.finditer(text):
+            spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 8, "CITIZENSHIP"))
 
     # ИНН
-    for m in _INN_RE.finditer(text):
-        spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 9, "INN"))
+    if has_digit:
+        for m in _INN_RE.finditer(text):
+            spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 9, "INN"))
 
     # Карта
-    for m in _CARD_RE.finditer(text):
-        spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 4, "CARD"))
+    if has_digit:
+        for m in _CARD_RE.finditer(text):
+            spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 4, "CARD"))
 
-# Держатель карты
-    for m in _CARD_HOLDER_RE.finditer(text):
-        near_card = False
-        for cm in _CARD_RE.finditer(text):
-            if abs(cm.start() - m.end()) <= 120 or abs(m.start() - cm.end()) <= 120:
-                near_card = True
-                break
-        near_holder = _has_context(
-            _CARD_HOLDER_CTX_RE,
-            text, m.start(), m.end(), 80,
-        )
-        if near_card or near_holder:
-            spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 6, "CARD_HOLDER"))
+    # Держатель карты
+    if has_upper:
+        for m in _CARD_HOLDER_RE.finditer(text):
+            near_card = False
+            for cm in _CARD_RE.finditer(text):
+                if abs(cm.start() - m.end()) <= 120 or abs(m.start() - cm.end()) <= 120:
+                    near_card = True
+                    break
+            near_holder = _has_context(
+                _CARD_HOLDER_CTX_RE,
+                text, m.start(), m.end(), 80, cache=_ctx_cache,
+            )
+            if near_card or near_holder:
+                spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 6, "CARD_HOLDER"))
 
     # Телефон
-    for m in _PHONE_RE.finditer(text):
-        if _has_context(_INN_CTX_RE, text, m.start(), m.end(), 40):
-            continue
-        spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 9, "PHONE"))
+    if has_digit:
+        for m in _PHONE_RE.finditer(text):
+            if _has_context(_INN_CTX_RE, text, m.start(), m.end(), 40, cache=_ctx_cache):
+                continue
+            spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 9, "PHONE"))
 
     # Email
     for m in _EMAIL_RE.finditer(text):
@@ -325,6 +363,21 @@ def mask_payload(text: str, allowed_types=None, mode="mask"):
         return (text, [], {}) if mode == "tokenize" else (text, [])
 
     spans = _detect(text)
+    return apply_spans(text, spans, allowed_types, mode)
+
+
+def detect_spans(text: str):
+    """Возвращает спаны ПД в тексте (для кэширования)."""
+    if not text:
+        return []
+    return _detect(text)
+
+
+def apply_spans(text: str, spans, allowed_types=None, mode="mask"):
+    """Применяет спаны к тексту (маскирование/токенизация).
+
+    Позволяет переиспользовать спаны из кэша без повторного _detect.
+    """
     if not spans:
         return (text, [], {}) if mode == "tokenize" else (text, [])
     if allowed_types is not None:

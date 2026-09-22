@@ -30,7 +30,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from detectors import mask_payload, redact_for_logging
+from detectors import mask_payload, redact_for_logging, detect_spans, apply_spans
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -204,6 +204,7 @@ def _looks_like_mask(payload: str, masked_text: str) -> bool:
 
 CACHE_MAX_RECORDS = 100000
 _RESULT_CACHE: "OrderedDict[str, tuple[str, list[str]]]" = OrderedDict()
+_SPAN_CACHE: "OrderedDict[str, list]" = OrderedDict()
 
 
 def _cache_get(payload_hash: str) -> Optional[tuple[str, list[str]]]:
@@ -220,6 +221,22 @@ def _cache_put(payload_hash: str, value: tuple[str, list[str]]) -> None:
     _RESULT_CACHE.move_to_end(payload_hash)
     while len(_RESULT_CACHE) > CACHE_MAX_RECORDS:
         _RESULT_CACHE.popitem(last=False)
+
+
+def _span_cache_get(payload_hash: str):
+    """LRU-чтение из кэша спанов."""
+    value = _SPAN_CACHE.get(payload_hash)
+    if value is not None:
+        _SPAN_CACHE.move_to_end(payload_hash)
+    return value
+
+
+def _span_cache_put(payload_hash: str, spans) -> None:
+    """LRU-запись в кэш спанов."""
+    _SPAN_CACHE[payload_hash] = spans
+    _SPAN_CACHE.move_to_end(payload_hash)
+    while len(_SPAN_CACHE) > CACHE_MAX_RECORDS:
+        _SPAN_CACHE.popitem(last=False)
 
 
 class ProcessService:
@@ -247,7 +264,7 @@ class ProcessService:
         """Основная логика: направление, идемпотентность, гонки.
 
         Возвращает (результат, список обнаруженных типов ПД, направление).
-        """
+"""
         lock = await self._store.get_lock(payload_id)
         try:
             acquired = await asyncio.wait_for(lock.acquire(), timeout=LOCK_TIMEOUT)
@@ -272,7 +289,13 @@ class ProcessService:
             if cached is not None:
                 masked, detected = cached
             else:
-                masked, detected = await self._run_mask(payload)
+                # Пробуем кэш спанов (учитывает систему и pii_types)
+                spans = _span_cache_get(payload_hash)
+                if spans is not None:
+                    masked, detected = apply_spans(payload, spans, self._allowed_types())
+                else:
+                    masked, detected = await self._run_mask(payload)
+                    _span_cache_put(payload_hash, detect_spans(payload))
                 _cache_put(payload_hash, (masked, detected))
             now = time.time()
             new_record = {
