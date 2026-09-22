@@ -211,7 +211,7 @@ def _span_cache_put(payload_hash: str, spans) -> None:
 
 class ProcessService:
     def __init__(self, store: StateStore, system_cfg: Optional[dict] = None,
-                 system_name: str = "default"):
+system_name: str = "default"):
         self._store = store
         self._system_cfg = system_cfg or _DEFAULT_SYSTEM
         self._system_name = system_name
@@ -224,6 +224,27 @@ class ProcessService:
 
     def _allow_unmask(self) -> bool:
         return bool(self._system_cfg.get("allow_unmask", True))
+
+    def _mask_mode(self) -> str:
+        """Возвращает режим маскирования: "mask" или "tokenize"."""
+        mode = self._system_cfg.get("mask_mode", "mask")
+        return mode if mode in ("mask", "tokenize") else "mask"
+
+    def _should_mask(self, detected_types: list) -> bool:
+        """Контекстное маскирование: маскировать только при наличии комбинации типов ПД.
+
+        Если mask_combinations пуст — маскировать всегда.
+        Иначе — маскировать, если найдена хотя бы одна комбинация
+        (все типы из комбинации присутствуют в detected_types).
+        """
+        combinations = self._system_cfg.get("mask_combinations", [])
+        if not combinations:
+            return True
+        detected_set = set(detected_types)
+        for combo in combinations:
+            if all(t in detected_set for t in combo):
+                return True
+        return False
 
     def _cache_key(self, payload: str) -> str:
         pii = self._system_cfg.get("pii_types", ["ALL"])
@@ -261,6 +282,7 @@ class ProcessService:
         if record is None:
             # Новый payload_id: маскируем, сохраняем, возвращаем маску
             payload_hash = self._cache_key(payload)
+            mode = self._mask_mode()
             cached = _cache_get(payload_hash)
             if cached is not None:
                 masked, detected = cached
@@ -268,11 +290,14 @@ class ProcessService:
                 # Пробуем кэш спанов (учитывает систему и pii_types)
                 spans = _span_cache_get(payload_hash)
                 if spans is not None:
-                    masked, detected = apply_spans(payload, spans, self._allowed_types())
+                    masked, detected = apply_spans(payload, spans, self._allowed_types(), mode)
                 else:
-                    masked, detected = await self._run_mask(payload)
+                    masked, detected = await self._run_mask(payload, mode)
                     _span_cache_put(payload_hash, detect_spans(payload))
                 _cache_put(payload_hash, (masked, detected))
+            # Контекстное маскирование: если комбинация типов не найдена — не маскируем
+            if not self._should_mask(detected):
+                masked = payload
             now = time.time()
             new_record = {
                 "payload_id": payload_id,
@@ -324,23 +349,24 @@ class ProcessService:
             direction = "mask"
         return result, record["detected_types"], direction
 
-    async def _run_mask(self, payload: str) -> tuple[str, list[str]]:
+    async def _run_mask(self, payload: str, mode: str = "mask") -> tuple[str, list[str]]:
         """Выполняет маскирование.
 
         Для коротких текстов (<= 2000) — синхронно в event loop,
         для средних (<= LARGE_TEXT_THRESHOLD) — в отдельном потоке,
         для крупных (> LARGE_TEXT_THRESHOLD) — чанкинг с перекрытием.
+        mode: "mask" — звёздочки, "tokenize" — токены.
         """
         allowed = self._allowed_types()
         if len(payload) > LARGE_TEXT_THRESHOLD:
-            return await self._run_mask_chunked(payload, allowed)
+            return await self._run_mask_chunked(payload, allowed, mode)
         if len(payload) > 2000:
             return await asyncio.wait_for(
-                asyncio.to_thread(mask_payload, payload, allowed), timeout=PROCESS_TIMEOUT
+                asyncio.to_thread(mask_payload, payload, allowed, mode), timeout=PROCESS_TIMEOUT
             )
-        return mask_payload(payload, allowed)
+        return mask_payload(payload, allowed, mode)
 
-    async def _run_mask_chunked(self, payload: str, allowed) -> tuple[str, list[str]]:
+    async def _run_mask_chunked(self, payload: str, allowed, mode: str = "mask") -> tuple[str, list[str]]:
         """Чанкинг крупного текста: разбивает на предложения, группирует
         в чанки по CHUNK_SIZE, маскирует каждый, склеивает.
 
@@ -368,7 +394,7 @@ class ProcessService:
         detected = []
         for chunk in chunks:
             masked_chunk, chunk_types = await asyncio.wait_for(
-                asyncio.to_thread(mask_payload, chunk, allowed), timeout=PROCESS_TIMEOUT
+                asyncio.to_thread(mask_payload, chunk, allowed, mode), timeout=PROCESS_TIMEOUT
             )
             results.append(masked_chunk)
             for t in chunk_types:

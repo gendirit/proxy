@@ -27,6 +27,9 @@
 | CVV-код | `CVV` | `_CVV_RE` |
 | Пин-код карты | `PIN` | `_PIN_RE` |
 | Имя держателя карты | `CARD_HOLDER` | `_CARD_HOLDER_RE` |
+| Загранпаспорт | `FOREIGN_PASSPORT` | `_FOREIGN_PASSPORT_RE` + контекст `_FOREIGN_PASSPORT_CTX_RE` |
+| Военный билет | `MILITARY_ID` | `_MILITARY_ID_RE` + контекст `_MILITARY_ID_CTX_RE` |
+| СНИЛС | `SNILS` | `_SNILS_RE` + контекст `_SNILS_CTX_RE` |
 
 ## Механизм определения принадлежности к ПД
 

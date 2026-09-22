@@ -83,6 +83,14 @@ _CARD_RE = re.compile(r"\b\d{4}[ \-]?\d{4}[ \-]?\d{4}[ \-]?\d{4}\b|\b\d{15,19}\b
 _CVV_RE = re.compile(r"(?i:cvv|cvc|cvv2|cvc2)[^\d]{0,15}(\d{3})\b")
 _PIN_RE = re.compile(r"(?i:пин[\-\s]?код|пин|pin|puk)[^\d]{0,15}(\d{4})\b")
 
+# --- Документы кроме паспорта РФ --------------------------------------------
+_FOREIGN_PASSPORT_RE = re.compile(r"\b([А-ЯЁ]{2}\s?\d{7}|\d{2}\s?\d{7})\b", re.IGNORECASE)
+_MILITARY_ID_RE = re.compile(r"\b([А-ЯЁ]{2}\s?\d{7})\b", re.IGNORECASE)
+_SNILS_RE = re.compile(r"\b(\d{3}[\- ]?\d{3}[\- ]?\d{3}[\- ]?\d{2})\b")
+_FOREIGN_PASSPORT_CTX_RE = re.compile(r"(?i:загранпаспорт|загран\.?паспорт|загран)")
+_MILITARY_ID_CTX_RE = re.compile(r"(?i:военный\s+билет|военн\.?билет|военник)")
+_SNILS_CTX_RE = re.compile(r"(?i:снилс|страховое\s+свидетельство)")
+
 # --- Адрес ------------------------------------------------------------------
 _ADDR_INDEX_RE = re.compile(r"\b(\d{6})\b")
 _ADDR_CITY_RE = re.compile(r"\b(г|город|с|село|дер|деревня|пос|поселок|станица|хутор)\.\s*([А-ЯЁ][\w\-]*)", re.IGNORECASE)
@@ -273,12 +281,30 @@ def _detect(text: str):
             elif _has_context(_BIRTH_CTX_RE, text, m.start(), m.end(), 60, cache=_ctx_cache):
                 spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 6, "BIRTH_DATE"))
 
-    # Водительское удостоверение
+# Водительское удостоверение
     if has_digit and dl_present:
         for m in _DL_RE.finditer(text):
             if _has_context(_DL_CTX_RE, text, m.start(), m.end(), 80, cache=_ctx_cache):
                 spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 5, "DRIVER_LICENSE"))
                 spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 5, "DRIVER_LICENSE"))
+
+    # Загранпаспорт
+    if has_digit:
+        for m in _FOREIGN_PASSPORT_RE.finditer(text):
+            if _has_context(_FOREIGN_PASSPORT_CTX_RE, text, m.start(), m.end(), 80, cache=_ctx_cache):
+                spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 5, "FOREIGN_PASSPORT"))
+
+    # Военный билет
+    if has_digit:
+        for m in _MILITARY_ID_RE.finditer(text):
+            if _has_context(_MILITARY_ID_CTX_RE, text, m.start(), m.end(), 80, cache=_ctx_cache):
+                spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 5, "MILITARY_ID"))
+
+    # СНИЛС
+    if has_digit:
+        for m in _SNILS_RE.finditer(text):
+            if _has_context(_SNILS_CTX_RE, text, m.start(), m.end(), 80, cache=_ctx_cache):
+                spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 5, "SNILS"))
 
 # Адрес
     if has_upper:
