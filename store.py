@@ -110,6 +110,15 @@ class SQLiteStore:
             rows = self._conn.execute("SELECT name, value FROM metrics").fetchall()
             return {row["name"]: row["value"] for row in rows}
 
+    def ping(self) -> bool:
+        """Проверяет доступность SQLite (SELECT 1). Возвращает True, если БД доступна."""
+        try:
+            with self._io_lock:
+                self._conn.execute("SELECT 1").fetchone()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def clear_metrics(self) -> None:
         """Очищает таблицу метрик (для selftest)."""
         with self._io_lock:

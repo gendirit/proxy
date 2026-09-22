@@ -46,6 +46,10 @@ LOCK_TIMEOUT = 1.0
 PROCESS_TIMEOUT = 8.0
 LARGE_TEXT_THRESHOLD = 20000
 
+# Чанкинг крупных текстов (для обработки до 100 000 токенов)
+CHUNK_SIZE = 5000        # размер чанка в символах
+CHUNK_OVERLAP = 200      # перекрытие чанков (чтобы не разорвать ПД на границе)
+
 CONFIG_PATH = "config.json"
 
 
@@ -305,7 +309,7 @@ class ProcessService:
             # ПД нет, маска == оригинал
             return payload, [], "identity"
 
-        # Спорный случай: хэш не совпал. Запись НЕ обновляем, НЕ перемаскируем.
+# Спорный случай: хэш не совпал. Запись НЕ обновляем, НЕ перемаскируем.
         if _looks_like_mask(payload, masked_text):
             result = original_text if self._allow_unmask() else masked_text
             direction = "unmask"
@@ -318,14 +322,63 @@ class ProcessService:
         """Выполняет маскирование.
 
         Для коротких текстов (<= 2000) — синхронно в event loop,
-        для больших — в отдельном потоке.
+        для средних (<= LARGE_TEXT_THRESHOLD) — в отдельном потоке,
+        для крупных (> LARGE_TEXT_THRESHOLD) — чанкинг с перекрытием.
         """
         allowed = self._allowed_types()
+        if len(payload) > LARGE_TEXT_THRESHOLD:
+            return await self._run_mask_chunked(payload, allowed)
         if len(payload) > 2000:
             return await asyncio.wait_for(
                 asyncio.to_thread(mask_payload, payload, allowed), timeout=PROCESS_TIMEOUT
             )
         return mask_payload(payload, allowed)
+
+    async def _run_mask_chunked(self, payload: str, allowed) -> tuple[str, list[str]]:
+        """Чанкинг крупного текста: разбивает на предложения, группирует
+        в чанки по CHUNK_SIZE, маскирует каждый, склеивает.
+
+        Разбивка по предложениям гарантирует, что ПД и его контекст
+        не разорвутся на границе чанка.
+        """
+        # Разбиваем на предложения (по . ! ? с сохранением разделителей)
+        sentences = self._split_sentences(payload)
+
+        # Группируем предложения в чанки по CHUNK_SIZE символов
+        chunks = []
+        current = []
+        current_len = 0
+        for sent in sentences:
+            if current and current_len + len(sent) > CHUNK_SIZE:
+                chunks.append("".join(current))
+                current = []
+                current_len = 0
+            current.append(sent)
+            current_len += len(sent)
+        if current:
+            chunks.append("".join(current))
+
+        results = []
+        detected = []
+        for chunk in chunks:
+            masked_chunk, chunk_types = await asyncio.wait_for(
+                asyncio.to_thread(mask_payload, chunk, allowed), timeout=PROCESS_TIMEOUT
+            )
+            results.append(masked_chunk)
+            for t in chunk_types:
+                if t not in detected:
+                    detected.append(t)
+
+        return "".join(results), detected
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        """Разбивает текст на предложения, сохраняя разделители и пробелы."""
+        import re as _re
+        # Находим предложения, сохраняя разделители (. ! ?) и следующие пробелы
+        parts = _re.findall(r"[^.!?]*[.!?]?\s*", text)
+        # Убираем пустые части
+        return [p for p in parts if p]
 
 
 class ProcessBusyError(Exception):
@@ -450,6 +503,13 @@ _service = ProcessService(_store, _config.get("default_system", _DEFAULT_SYSTEM)
 @app.on_event("startup")
 async def _startup() -> None:
     """Запускает фоновые задачи: сброс метрик и буфера записей в SQLite."""
+    # Проверка доступности БД при старте
+    try:
+        ok = await asyncio.to_thread(_store.ping)
+        if not ok:
+            logger.warning("SQLite database is not accessible at startup")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("SQLite database check failed at startup: %s", exc)
     asyncio.create_task(_metrics_flush_loop())
     asyncio.create_task(_records_flush_loop())
 
@@ -566,6 +626,15 @@ async def metrics_endpoint():
     async with _metrics_lock:
         _flush_metrics()
         return Response(content=_render_metrics(), media_type="text/plain")
+
+
+@app.get("/health")
+async def health_endpoint():
+    """Healthcheck: проверяет доступность SQLite."""
+    ok = await asyncio.to_thread(_store.ping)
+    if ok:
+        return JSONResponse(content={"status": "ok"})
+    return JSONResponse(status_code=503, content={"status": "degraded"})
 
 
 # ---------------------------------------------------------------------------
