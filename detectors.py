@@ -93,13 +93,14 @@ _ADDR_APT_RE = re.compile(r"\b(кв|квартира|ком|комната|оф|
 # --- ФИО и держатель карты ---------------------------------------------------
 _FIO_RE = re.compile(
     r"(?<![А-ЯЁа-яё])"
-    r"([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+(?:ович|овна|евич|евна|ич|ина))"
+    r"([А-ЯЁ][а-яё]+|[А-ЯЁ]{2,})\s+([А-ЯЁ][а-яё]+|[А-ЯЁ]{2,})\s+([А-ЯЁ][а-яё]+(?:ович|овна|евич|евна|ич|ина)|[А-ЯЁ]{2,})"
     r"(?![А-ЯЁа-яё])"
 )
 _CARD_HOLDER_RE = re.compile(r"\b([A-Z]{2,}(?:\s+[A-Z]{2,}){1,3})\b")
 
 # --- Контекстные регэкспы (компилируются один раз) --------------------------
 _ADDR_INDEX_CTX_RE = re.compile(r"(?i:индекс|адрес|ул\.|д\.|кв\.|г\.)")
+_BANK_CTX_RE = re.compile(r"(?i:отделение\s+банка|банк|банка|банке|банком|офис\s+банка)")
 _CARD_HOLDER_CTX_RE = re.compile(r"(?i:держатель|карта|карты|карту|картой|владелец)")
 _INN_CTX_RE = re.compile(r"(?i:инн)")
 _CITIZENSHIP_RE = re.compile(
@@ -286,13 +287,20 @@ def _detect(text: str):
             (_ADDR_STREET_RE, "ADDRESS"),
         ):
             for m in pattern.finditer(text):
+                # Пропускаем адрес отделения Банка (не ПД)
+                if _has_context(_BANK_CTX_RE, text, m.start(), m.end(), 80, cache=_ctx_cache):
+                    continue
                 spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 8, type_))
         for pattern in (_ADDR_HOUSE_RE, _ADDR_APT_RE):
             for m in pattern.finditer(text):
+                if _has_context(_BANK_CTX_RE, text, m.start(), m.end(), 80, cache=_ctx_cache):
+                    continue
                 spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 8, "ADDRESS"))
     if has_digit:
         for m in _ADDR_INDEX_RE.finditer(text):
             if _has_context(_ADDR_INDEX_CTX_RE, text, m.start(), m.end(), 60, cache=_ctx_cache):
+                if _has_context(_BANK_CTX_RE, text, m.start(), m.end(), 80, cache=_ctx_cache):
+                    continue
                 spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 8, "ADDRESS"))
 
     # Гражданство
