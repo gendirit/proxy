@@ -394,6 +394,16 @@ async def _metrics_flush_loop() -> None:
             pass
 
 
+async def _records_flush_loop() -> None:
+    """Фоновая задача: периодический сброс буфера записей в SQLite (раз в 200 мс)."""
+    while True:
+        await asyncio.sleep(0.2)
+        try:
+            await _store.flush_pending()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _render_metrics() -> str:
     """Рендерит метрики в Prometheus-формат из SQLite (агрегированные)."""
     data = _store.read_metrics()
@@ -427,16 +437,21 @@ _service = ProcessService(_store, _config.get("default_system", _DEFAULT_SYSTEM)
 
 @app.on_event("startup")
 async def _startup() -> None:
-    """Запускает фоновую задачу сброса метрик в SQLite."""
+    """Запускает фоновые задачи: сброс метрик и буфера записей в SQLite."""
     asyncio.create_task(_metrics_flush_loop())
+    asyncio.create_task(_records_flush_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    """Сбрасывает метрики и закрывает хранилище."""
+    """Сбрасывает метрики и буфер записей, закрывает хранилище."""
     try:
         async with _metrics_lock:
             _flush_metrics()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await _store.flush_pending()
     except Exception:  # noqa: BLE001
         pass
     _store.close()
