@@ -44,7 +44,7 @@ bash pack.sh                     # сборка solution.zip
 
 Переменные окружения:
 - `DB_PATH` — путь к SQLite-файлу (по умолчанию `state.db`);
-- `WORKERS` — число воркеров uvicorn (по умолчанию `4`).
+- `WORKERS` — число воркеров uvicorn (по умолчанию `cpu_count()-1`, автоопределение по числу ядер CPU).
 
 ## Контракт POST /process
 
