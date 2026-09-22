@@ -19,6 +19,7 @@
 | `docs/README.md` | Документ-оглавление документации. |
 | `docs/ROADMAP.md` | Дорожная карта проекта. |
 | `docs/STATE.md` | Настоящий файл состояния. |
+| `docs/ACCEPTANCE_CRITERIA.md` | Критерии приёмки (сверка с критериями оценивания). |
 | `docs/modules/main.md` | Документация модуля `main.py`. |
 | `docs/modules/detectors.md` | Документация модуля `detectors.py`. |
 | `docs/modules/config.md` | Документация модуля `config.json`. |
