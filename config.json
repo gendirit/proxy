@@ -1,0 +1,7 @@
+{
+  "default_system": {"enabled": true, "pii_types": ["ALL"], "allow_unmask": true},
+  "systems": [
+    {"name": "crm-assistant", "enabled": true, "pii_types": ["ALL"], "allow_unmask": true},
+    {"name": "blocked-bot", "enabled": false, "pii_types": [], "allow_unmask": false}
+  ]
+}

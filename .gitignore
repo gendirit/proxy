@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Сборка и артефакты
+build/
+dist/
+out/
+bin/
+obj/
+target/
+*.zip
+
+# Служебные каталоги
+.git/
+.idea/
+.vscode/
+.kilo/
+coverage/
+*.egg-info/
+
+# Техническое задание (не исходный код)
+technical specification/
+
+# Логи
+*.log
