@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from detectors import mask_payload, redact_for_logging, detect_spans, apply_spans
-from store import SQLiteStore
+from store import SQLiteStore, FLUSH_INTERVAL
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -251,6 +251,12 @@ class ProcessService:
     async def _process_locked(self, payload: str, payload_id: str) -> tuple[str, list[str], str]:
         # Повторная проверка после получения блокировки (double-check)
         record = await self._store.get(payload_id)
+
+        # Если запись не найдена, но payload похож на маску (демаскирование),
+        # возможно запись ещё в буфере другого воркера — ждём сброса и повторяем.
+        if record is None and "*" in payload:
+            await asyncio.sleep(FLUSH_INTERVAL)
+            record = await self._store.get(payload_id)
 
         if record is None:
             # Новый payload_id: маскируем, сохраняем, возвращаем маску
