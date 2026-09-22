@@ -82,6 +82,15 @@ _FIO_RE = re.compile(
 )
 _CARD_HOLDER_RE = re.compile(r"\b([A-Z]{2,}(?:\s+[A-Z]{2,}){1,3})\b")
 
+# --- Контекстные регэкспы (компилируются один раз) --------------------------
+_ADDR_INDEX_CTX_RE = re.compile(r"(?i:индекс|адрес|ул\.|д\.|кв\.|г\.)")
+_CARD_HOLDER_CTX_RE = re.compile(r"(?i:держатель|карта|карты|карту|картой|владелец)")
+_INN_CTX_RE = re.compile(r"(?i:инн)")
+_CITIZENSHIP_RE = re.compile(
+    r"(?i:гражданин|гражданка|гражданство)\s*:?\s*"
+    r"([А-ЯЁа-яёA-Za-z][\w\-]*(?:\s+[А-ЯЁа-яёA-Za-z][\w\-]*){0,3})"
+)
+
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -117,9 +126,14 @@ _PLACE_BIRTH_VALUE_RE = re.compile(
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
+# Таблица перевода для mask_value: буквы/цифры -> '*', остальное сохраняется.
+_MASK_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+_MASK_TRANSLATE = str.maketrans(_MASK_CHARS, "*" * len(_MASK_CHARS))
+
+
 def mask_value(text: str) -> str:
     """Полное скрытие: буквы/цифры -> '*', разделители сохраняются."""
-    return re.sub(r"[0-9A-Za-zА-Яа-яЁё]", "*", text)
+    return text.translate(_MASK_TRANSLATE)
 
 
 def mask_all(text: str) -> str:
@@ -227,14 +241,14 @@ def _detect(text: str):
             elif _has_context(_BIRTH_CTX_RE, text, m.start(), m.end(), 60):
                 spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 6, "BIRTH_DATE"))
 
-    # Водительское удостоверение
-    if _has_context(_DL_CTX_RE, text, 0, len(text), len(text)):
+# Водительское удостоверение
+    if dl_present:
         for m in _DL_RE.finditer(text):
             if _has_context(_DL_CTX_RE, text, m.start(), m.end(), 80):
                 spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 5, "DRIVER_LICENSE"))
                 spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 5, "DRIVER_LICENSE"))
 
-    # Адрес
+# Адрес
     for pattern, type_ in (
         (_ADDR_CITY_RE, "ADDRESS"),
         (_ADDR_STREET_RE, "ADDRESS"),
@@ -245,11 +259,11 @@ def _detect(text: str):
         for m in pattern.finditer(text):
             spans.append(Span(m.start(2), m.end(2), mask_value(m.group(2)), 8, "ADDRESS"))
     for m in _ADDR_INDEX_RE.finditer(text):
-        if _has_context(re.compile(r"(?i:индекс|адрес|ул\.|д\.|кв\.|г\.)"), text, m.start(), m.end(), 60):
+        if _has_context(_ADDR_INDEX_CTX_RE, text, m.start(), m.end(), 60):
             spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 8, "ADDRESS"))
 
     # Гражданство
-    for m in re.finditer(r"(?i:гражданин|гражданка|гражданство)\s*:?\s*([А-ЯЁа-яёA-Za-z][\w\-]*(?:\s+[А-ЯЁа-яёA-Za-z][\w\-]*){0,3})", text):
+    for m in _CITIZENSHIP_RE.finditer(text):
         spans.append(Span(m.start(1), m.end(1), mask_value(m.group(1)), 8, "CITIZENSHIP"))
 
     # ИНН
@@ -260,7 +274,7 @@ def _detect(text: str):
     for m in _CARD_RE.finditer(text):
         spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 4, "CARD"))
 
-    # Держатель карты
+# Держатель карты
     for m in _CARD_HOLDER_RE.finditer(text):
         near_card = False
         for cm in _CARD_RE.finditer(text):
@@ -268,14 +282,13 @@ def _detect(text: str):
                 near_card = True
                 break
         near_holder = _has_context(
-            re.compile(r"(?i:держатель|карта|карты|карту|картой|владелец)"),
+            _CARD_HOLDER_CTX_RE,
             text, m.start(), m.end(), 80,
         )
         if near_card or near_holder:
             spans.append(Span(m.start(), m.end(), mask_value(m.group(0)), 6, "CARD_HOLDER"))
 
     # Телефон
-    _INN_CTX_RE = re.compile(r"(?i:инн)")
     for m in _PHONE_RE.finditer(text):
         if _has_context(_INN_CTX_RE, text, m.start(), m.end(), 40):
             continue
