@@ -21,7 +21,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import multiprocessing
 import os
 import sys
 import tempfile
@@ -54,17 +53,18 @@ CONFIG_PATH = "config.json"
 
 
 def _default_workers() -> int:
-    """Автоопределение числа воркеров по количеству ядер CPU.
+    """Число воркеров по умолчанию.
 
-    Детекторы — CPU-интенсивные, поэтому оставляем одно ядро для ОС.
+    Зафиксировано 3 воркера: при текущей архитектуре (SQLite + writer-поток
+    на воркер) больше воркеров ухудшает результат из-за конкуренции за SQLite.
+    Оптимально для 4-ядерного железа организаторов.
     """
-    cpus = multiprocessing.cpu_count() or 1
-    return max(1, cpus - 1)
+    return 3
 
 
 # Переменные окружения для многопроцессного запуска
 DB_PATH = os.environ.get("DB_PATH", "state.db")
-# WORKERS: если задан через env — используем его, иначе автоопределение по CPU
+# WORKERS: если задан через env — используем его, иначе 3 по умолчанию
 WORKERS = int(os.environ.get("WORKERS", str(_default_workers())))
 
 _DEFAULT_SYSTEM = {

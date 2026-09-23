@@ -96,11 +96,11 @@ Healthcheck: проверяет доступность SQLite (`SELECT 1`). Во
 ## Запуск
 
 ```bash
-# Автоопределение числа воркеров (cpu_count()-1), SQLite-хранилище state.db
+# 3 воркера по умолчанию, SQLite-хранилище state.db
 python main.py
 
 # Явное указание числа воркеров и пути к БД
-DB_PATH=state.db WORKERS=4 python main.py
+DB_PATH=state.db WORKERS=5 python main.py
 
 # Selftest
 python main.py --selftest
@@ -108,7 +108,7 @@ python main.py --selftest
 
 Переменные окружения:
 - `DB_PATH` — путь к SQLite-файлу (по умолчанию `state.db`);
-- `WORKERS` — число воркеров uvicorn (по умолчанию `cpu_count()-1`, автоопределение по числу ядер CPU).
+- `WORKERS` — число воркеров uvicorn (по умолчанию 3, фиксировано; переопределяется через env).
 
 ## Зависимости
 
