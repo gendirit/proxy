@@ -140,7 +140,7 @@ class SQLiteStore:
                 )
                 self._conn.commit()
         except Exception as exc:  # noqa: BLE001
-            logger.error("SQLite batch write failed for %d records: %s", len(batch), exc)
+            logger.exception("SQLite batch write failed for %d records: %s", len(batch), exc)
             for pid, rec in batch:
                 self._write_queue.put((pid, rec))
 
@@ -178,7 +178,7 @@ class SQLiteStore:
                 )
                 self._conn.commit()
         except Exception as exc:  # noqa: BLE001
-            logger.error("SQLite local write failed for %s: %s", payload_id, exc)
+            logger.exception("SQLite local write failed for %s: %s", payload_id, exc)
 
     def flush_metrics(self, metrics: dict) -> None:
         """Сбрасывает in-memory метрики в SQLite (UPSERT, суммирование).
@@ -357,7 +357,7 @@ class SQLiteStore:
         while not self._write_queue.empty():
             await asyncio.sleep(0.01)
 
-    async def get_lock(self, payload_id: str) -> asyncio.Lock:
+    def get_lock(self, payload_id: str) -> asyncio.Lock:
         """Возвращает asyncio.Lock из пула (по хэшу payload_id).
 
         Ограниченный пул блокировок: не создаёт блокировку на каждый id,

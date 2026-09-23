@@ -298,7 +298,7 @@ system_name: str = "default"):
                     await self._store.insert_if_absent(payload_id, new_record)
                     return masked, detected, "mask"
 
-        lock = await self._store.get_lock(payload_id)
+        lock = self._store.get_lock(payload_id)
         try:
             acquired = await asyncio.wait_for(lock.acquire(), timeout=LOCK_TIMEOUT)
         except asyncio.TimeoutError:
@@ -590,8 +590,9 @@ async def _startup() -> None:
             logger.warning("SQLite database is not accessible at startup")
     except Exception as exc:  # noqa: BLE001
         logger.warning("SQLite database check failed at startup: %s", exc)
-    asyncio.create_task(_metrics_flush_loop())
-    asyncio.create_task(_records_flush_loop())
+    # Сохраняем задачи в переменные, чтобы предотвратить сборку мусора
+    _metrics_task = asyncio.create_task(_metrics_flush_loop())
+    _records_task = asyncio.create_task(_records_flush_loop())
 
 
 @app.on_event("shutdown")
@@ -752,7 +753,7 @@ class ChatResponse(BaseModel):
 @app.post("/v1/chat/completions", response_model=ChatResponse)
 async def chat_completions(req: ChatRequest):
     joined = "\n".join(m.content for m in req.messages)
-    masked, detected, token_map = mask_payload(joined, mode="tokenize")
+    masked, _, token_map = mask_payload(joined, mode="tokenize")
     llm_out = mock_llm(masked)
     result = llm_out
     for token, value in token_map.items():

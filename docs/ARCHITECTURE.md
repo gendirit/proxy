@@ -66,5 +66,5 @@
 ## Развёртывание
 
 - Сервис развёрнут на VPS как Compose-проект `pii-proxy`.
-- URL: `http://81.177.167.12:8001/process`.
+- URL: `http://81.177.167.12:8001`.
 - 3 воркера uvicorn, SQLite-хранилище, named-том `pii-data`.
