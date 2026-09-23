@@ -228,7 +228,7 @@ def _global_span_cache_put(text_hash: str, spans) -> None:
 
 
 class ProcessService:
-    def __init__(self, store: StateStore, system_cfg: Optional[dict] = None,
+    def __init__(self, store: SQLiteStore, system_cfg: Optional[dict] = None,
 system_name: str = "default"):
         self._store = store
         self._system_cfg = system_cfg or _DEFAULT_SYSTEM

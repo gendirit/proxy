@@ -34,3 +34,8 @@ technical specification/
 *.db
 *.db-wal
 *.db-shm
+
+# Секреты и конфигурация окружения
+.env
+.env.*
+!.env.example
