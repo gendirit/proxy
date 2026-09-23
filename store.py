@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import sqlite3
 import threading
 import time
@@ -23,9 +24,12 @@ TTL_SECONDS = 3600
 MAX_RECORDS = 100000
 CACHE_MAX_RECORDS = 100000
 
-# Параметры батчинга записи (ленивая запись)
-FLUSH_INTERVAL = 0.2        # сброс буфера каждые 200 мс
-FLUSH_THRESHOLD = 1000      # сброс буфера при накоплении 1000 записей
+# Параметры батчинга записи (writer-поток)
+FLUSH_INTERVAL = 0.1        # интервал проверки очереди writer-потоком (100 мс)
+FLUSH_THRESHOLD = 2000      # размер пачки записей для одной транзакции
+
+# Пул блокировок на payload_id (ограниченный, с хэшированием)
+LOCK_POOL_SIZE = 1024
 
 
 class SQLiteStore:
@@ -50,12 +54,16 @@ class SQLiteStore:
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.execute("PRAGMA synchronous=OFF")
         self._io_lock = threading.Lock()
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._locks_guard = asyncio.Lock()
+        # Пул блокировок на payload_id (ограниченный, с хэшированием)
+        self._locks: list[asyncio.Lock] = [asyncio.Lock() for _ in range(LOCK_POOL_SIZE)]
         self._cache: "OrderedDict[str, dict]" = OrderedDict()
-        # Буфер несохранённых записей (ленивая запись)
+        # Очередь несохранённых записей + writer-поток (запись в SQLite сразу)
         self._pending: "OrderedDict[str, dict]" = OrderedDict()
         self._pending_lock = threading.Lock()
+        self._write_queue: "queue.Queue" = queue.Queue()
+        self._writer_stop = threading.Event()
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -83,6 +91,58 @@ class SQLiteStore:
                 """
             )
             self._conn.commit()
+
+    def _writer_loop(self) -> None:
+        """Writer-поток: читает записи из очереди и пишет в SQLite пачками.
+
+        Записи попадают в SQLite сразу (через writer-поток), поэтому
+        доступны всем воркерам без ожидания сброса буфера.
+        """
+        while not self._writer_stop.is_set():
+            try:
+                # Ждём запись в очереди (с таймаутом для проверки stop)
+                item = self._write_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            batch = [item]
+            # Собираем пачку записей
+            while len(batch) < FLUSH_THRESHOLD:
+                try:
+                    batch.append(self._write_queue.get_nowait())
+                except queue.Empty:
+                    break
+            self._write_batch(batch)
+
+    def _write_batch(self, batch: list) -> None:
+        """Пишет пачку записей в SQLite одной транзакцией."""
+        try:
+            with self._io_lock:
+                self._conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO records
+                    (payload_id, original_text, original_hash, masked_text,
+                     masked_hash, detected_types, created_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            pid,
+                            rec["original_text"],
+                            rec["original_hash"],
+                            rec["masked_text"],
+                            rec["masked_hash"],
+                            json.dumps(rec["detected_types"], ensure_ascii=False),
+                            rec["created_at"],
+                            rec["expires_at"],
+                        )
+                        for pid, rec in batch
+                    ],
+                )
+                self._conn.commit()
+        except Exception:  # noqa: BLE001
+            # При ошибке возвращаем записи в очередь для повторной попытки
+            for pid, rec in batch:
+                self._write_queue.put((pid, rec))
 
     def flush_metrics(self, metrics: dict) -> None:
         """Сбрасывает in-memory метрики в SQLite (UPSERT, суммирование).
@@ -240,10 +300,10 @@ class SQLiteStore:
         await asyncio.to_thread(self._evict_if_needed)
 
     async def insert_if_absent(self, payload_id: str, record: dict) -> bool:
-        """Ленивая запись: добавляет запись в буфер, сбрасывает в SQLite пачками.
+        """Добавляет запись в очередь writer-потока (запись в SQLite сразу).
 
-        Возвращает True, если запись добавлена в буфер (создана).
-        Сброс в SQLite происходит по таймеру (200 мс) или при пороге (1000).
+        Возвращает True, если запись добавлена (создана).
+        Writer-поток пишет в SQLite пачками, записи доступны всем воркерам.
         """
         with self._pending_lock:
             if payload_id in self._pending:
@@ -252,56 +312,27 @@ class SQLiteStore:
                 return False
             self._pending[payload_id] = record
             self._cache_put(payload_id, record)
-            should_flush = len(self._pending) >= FLUSH_THRESHOLD
-        if should_flush:
-            await self.flush_pending()
+        self._write_queue.put((payload_id, record))
         return True
 
     async def flush_pending(self) -> None:
-        """Сбрасывает буфер несохранённых записей в SQLite одной транзакцией."""
-        with self._pending_lock:
-            if not self._pending:
-                return
-            pending = list(self._pending.items())
-            self._pending.clear()
-
-        def _flush():
-            with self._io_lock:
-                self._conn.executemany(
-                    """
-                    INSERT OR IGNORE INTO records
-                    (payload_id, original_text, original_hash, masked_text,
-                     masked_hash, detected_types, created_at, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            pid,
-                            rec["original_text"],
-                            rec["original_hash"],
-                            rec["masked_text"],
-                            rec["masked_hash"],
-                            json.dumps(rec["detected_types"], ensure_ascii=False),
-                            rec["created_at"],
-                            rec["expires_at"],
-                        )
-                        for pid, rec in pending
-                    ],
-                )
-                self._conn.commit()
-
-        await asyncio.to_thread(_flush)
-        await asyncio.to_thread(self._evict_if_needed)
+        """Сбрасывает очередь записей в SQLite (принудительно)."""
+        # Writer-поток уже пишет в SQLite; здесь ждём опустошения очереди
+        while not self._write_queue.empty():
+            await asyncio.sleep(0.01)
 
     async def get_lock(self, payload_id: str) -> asyncio.Lock:
-        """Возвращает локальный asyncio.Lock для гонок в рамках одного процесса."""
-        async with self._locks_guard:
-            lock = self._locks.get(payload_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._locks[payload_id] = lock
-            return lock
+        """Возвращает asyncio.Lock из пула (по хэшу payload_id).
+
+        Ограниченный пул блокировок: не создаёт блокировку на каждый id,
+        снижает накладные расходы и количество 429.
+        """
+        idx = hash(payload_id) % LOCK_POOL_SIZE
+        return self._locks[idx]
 
     def close(self) -> None:
+        # Останавливаем writer-поток и ждём его завершения
+        self._writer_stop.set()
+        self._writer_thread.join(timeout=2.0)
         with self._io_lock:
             self._conn.close()
