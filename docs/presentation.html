@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Модуль безопасности персональных данных — презентация</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; }
+  .slide {
+    width: 1000px; height: 562px; margin: 20px auto;
+    background: #fff; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+    padding: 50px 60px; page-break-after: always;
+  }
+  h1 { font-size: 34px; color: #1a1a2e; margin-bottom: 16px; }
+  h2 { font-size: 26px; color: #16213e; margin-bottom: 20px; border-bottom: 3px solid #0f3460; padding-bottom: 8px; }
+  p { font-size: 18px; color: #333; line-height: 1.6; margin-bottom: 10px; }
+  ul { list-style: none; }
+  li { font-size: 18px; color: #333; line-height: 1.7; padding-left: 24px; position: relative; margin-bottom: 8px; }
+  li::before { content: "•"; color: #0f3460; font-weight: bold; position: absolute; left: 0; }
+  .subtitle { font-size: 20px; color: #555; }
+  .highlight { color: #0f3460; font-weight: bold; }
+  .metric { font-size: 22px; color: #0f3460; font-weight: bold; }
+  .footer { margin-top: 30px; font-size: 14px; color: #999; text-align: center; }
+  .code { background: #f5f5f5; border-radius: 6px; padding: 12px 16px; font-family: Consolas, monospace; font-size: 15px; color: #333; margin: 10px 0; }
+</style>
+</head>
+<body>
+
+<!-- Слайд 1: Титул -->
+<div class="slide">
+  <h1>Модуль безопасности персональных данных</h1>
+  <p class="subtitle">Прокси для LLM: идентификация, маскирование и демаскирование ПД</p>
+  <p class="subtitle">Хакатон AlfaGen</p>
+  <div class="footer">2026</div>
+</div>
+
+<!-- Слайд 2: Проблема и решение -->
+<div class="slide">
+  <h2>Проблема и решение</h2>
+  <ul>
+    <li>При обращении к LLM критично защищать персональные данные (ПД).</li>
+    <li>Решение: прокси-модуль, который идентифицирует, маскирует и демаскирует ПД.</li>
+    <li>Встраивается в цепочку: <span class="highlight">Система-потребитель → Модуль → LLM → Потребитель</span>.</li>
+    <li>Гибкая настройка под разные системы-потребители.</li>
+  </ul>
+</div>
+
+<!-- Слайд 3: Архитектура -->
+<div class="slide">
+  <h2>Архитектура</h2>
+  <ul>
+    <li>FastAPI-сервис: <span class="highlight">POST /process</span> (маскирование/демаскирование).</li>
+    <li>Детекторы ПД (17 типов) на регэкспах с разрешением пересечений.</li>
+    <li>SQLite-хранилище записей (общее для воркеров), батчинг записи.</li>
+    <li>Гибкая настройка систем и типов ПД через config.json.</li>
+    <li>Метрики (GET /metrics) и healthcheck (GET /health).</li>
+  </ul>
+</div>
+
+<!-- Слайд 4: Ключевые возможности -->
+<div class="slide">
+  <h2>Ключевые возможности</h2>
+  <ul>
+    <li>17 типов ПД: ФИО, даты, паспорт, гражданство, адрес, email, телефон, ИНН, карта, CVV, PIN и др.</li>
+    <li>Исключение публичных личностей и адресов отделений Банка.</li>
+    <li>Независимость от регистра, вариации дат и разделяющих слов.</li>
+    <li>Демаскирование по payload_id с сохранением позиций.</li>
+    <li>Токенизация, документы кроме паспорта РФ, контекстное маскирование.</li>
+  </ul>
+</div>
+
+<!-- Слайд 5: Производительность -->
+<div class="slide">
+  <h2>Производительность</h2>
+  <ul>
+    <li>RPS: <span class="metric">~2401</span> (цель ТЗ — 1000, повышенный уровень — 2000).</li>
+    <li>Latency: p50 ~5ms, p95 ~77ms, p99 ~139ms.</li>
+    <li>Обработка крупных текстов до 100 000 токенов (чанкинг).</li>
+    <li>3 воркера (оптимально для 4-ядерного железа).</li>
+  </ul>
+</div>
+
+<!-- Слайд 6: Демо -->
+<div class="slide">
+  <h2>Демо</h2>
+  <p>POST /process с {payload, payload_id} → {result}</p>
+  <div class="code">curl -X POST http://81.177.167.12:8001/process \<br>
+  &nbsp;&nbsp;-H "Content-Type: application/json" \<br>
+  &nbsp;&nbsp;-d '{"payload":"Клиент Иванов Иван Иванович, паспорт 4509 123456","payload_id":"check-1"}'</div>
+  <ul>
+    <li>Маскирование: ПД скрываются (<span class="highlight">*</span>).</li>
+    <li>Демаскирование: повторный запрос с тем же payload_id → исходная строка.</li>
+  </ul>
+</div>
+
+<!-- Слайд 7: Итоги -->
+<div class="slide">
+  <h2>Итоги</h2>
+  <ul>
+    <li>Полное соответствие ТЗ и критериям приёмки (~27-30 из 30).</li>
+    <li>Высокая производительность и стабильность.</li>
+    <li>Безопасность: ПД не попадают в логи и метрики.</li>
+    <li>Гибкая настройка и расширяемость.</li>
+    <li>Развёрнут на VPS: <span class="highlight">http://81.177.167.12:8001/process</span></li>
+  </ul>
+</div>
+
+</body>
+</html>
