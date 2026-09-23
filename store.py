@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import queue
 import sqlite3
 import threading
 import time
 from collections import OrderedDict
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 TTL_SECONDS = 3600
 MAX_RECORDS = 100000
@@ -136,7 +139,8 @@ class SQLiteStore:
                     ],
                 )
                 self._conn.commit()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.error("SQLite batch write failed for %d records: %s", len(batch), exc)
             for pid, rec in batch:
                 self._write_queue.put((pid, rec))
 
@@ -173,8 +177,8 @@ class SQLiteStore:
                     ),
                 )
                 self._conn.commit()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.error("SQLite local write failed for %s: %s", payload_id, exc)
 
     def flush_metrics(self, metrics: dict) -> None:
         """Сбрасывает in-memory метрики в SQLite (UPSERT, суммирование).

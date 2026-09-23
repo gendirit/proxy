@@ -44,6 +44,7 @@ MAX_RECORDS = 100000
 LOCK_TIMEOUT = 0.5
 PROCESS_TIMEOUT = 8.0
 LARGE_TEXT_THRESHOLD = 20000
+MAX_PAYLOAD_SIZE = 1000000  # максимальный размер payload (защита от DoS)
 
 # Чанкинг крупных текстов (для обработки до 100 000 токенов)
 CHUNK_SIZE = 5000        # размер чанка в символах
@@ -628,6 +629,8 @@ async def process_endpoint(request: Request):
     payload_id = body.get("payload_id") if isinstance(body, dict) else None
     if not isinstance(payload, str) or not isinstance(payload_id, str):
         return JSONResponse(status_code=422, content={"result": ""})
+    if len(payload) > MAX_PAYLOAD_SIZE:
+        return JSONResponse(status_code=413, content={"result": ""})
 
     system_id = request.headers.get("X-System-Id")
     system_name = system_id or "default"
