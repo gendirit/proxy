@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py detectors.py store.py writer.py config.json .
+COPY main.py detectors.py store.py config.json .
 
 EXPOSE 8000
 

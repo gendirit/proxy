@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 ZIP_NAME="solution.zip"
-FILES=("main.py" "detectors.py" "store.py" "writer.py" "requirements.txt" "config.json")
+FILES=("main.py" "detectors.py" "store.py" "requirements.txt" "config.json")
 
 # Удаляем старый архив, если есть
 rm -f "$ZIP_NAME"

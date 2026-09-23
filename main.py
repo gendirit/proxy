@@ -23,7 +23,6 @@ import json
 import logging
 import multiprocessing
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -67,8 +66,6 @@ def _default_workers() -> int:
 DB_PATH = os.environ.get("DB_PATH", "state.db")
 # WORKERS: если задан через env — используем его, иначе автоопределение по CPU
 WORKERS = int(os.environ.get("WORKERS", str(_default_workers())))
-# Порт сокета общего writer-процесса
-WRITER_PORT = int(os.environ.get("WRITER_PORT", "8001"))
 
 _DEFAULT_SYSTEM = {
     "enabled": True,
@@ -854,18 +851,8 @@ def main() -> None:
         sys.exit(_selftest())
     import uvicorn
 
-    # Запускаем общий writer-процесс (один на все воркеры)
-    writer_proc = subprocess.Popen(
-        [sys.executable, "writer.py", "--port", str(WRITER_PORT), "--db", DB_PATH],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        # workers > 1 требует передавать приложение строкой импорта
-        uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=WORKERS)
-    finally:
-        writer_proc.terminate()
-        writer_proc.wait(timeout=5)
+    # workers > 1 требует передавать приложение строкой импорта
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=WORKERS)
 
 
 if __name__ == "__main__":
