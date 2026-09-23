@@ -54,6 +54,8 @@ class SQLiteStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.execute("PRAGMA synchronous=OFF")
+        self._conn.execute("PRAGMA cache_size=-20000")   # ~20 МБ кэша
+        self._conn.execute("PRAGMA temp_store=MEMORY")   # временные таблицы в памяти
         self._io_lock = threading.Lock()
         # Пул блокировок на payload_id (ограниченный, с хэшированием)
         self._locks: list[asyncio.Lock] = [asyncio.Lock() for _ in range(LOCK_POOL_SIZE)]

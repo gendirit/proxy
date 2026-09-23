@@ -42,7 +42,7 @@ from store import SQLiteStore, FLUSH_INTERVAL
 
 TTL_SECONDS = 3600
 MAX_RECORDS = 100000
-LOCK_TIMEOUT = 1.0
+LOCK_TIMEOUT = 0.5
 PROCESS_TIMEOUT = 8.0
 LARGE_TEXT_THRESHOLD = 20000
 
@@ -175,6 +175,8 @@ def _looks_like_mask(payload: str, masked_text: str) -> bool:
 CACHE_MAX_RECORDS = 100000
 _RESULT_CACHE: "OrderedDict[str, tuple[str, list[str]]]" = OrderedDict()
 _SPAN_CACHE: "OrderedDict[str, list]" = OrderedDict()
+# Глобальный кэш спанов по хэшу текста (без учёта системы)
+_GLOBAL_SPAN_CACHE: "OrderedDict[str, list]" = OrderedDict()
 
 
 def _cache_get(payload_hash: str) -> Optional[tuple[str, list[str]]]:
@@ -207,6 +209,22 @@ def _span_cache_put(payload_hash: str, spans) -> None:
     _SPAN_CACHE.move_to_end(payload_hash)
     while len(_SPAN_CACHE) > CACHE_MAX_RECORDS:
         _SPAN_CACHE.popitem(last=False)
+
+
+def _global_span_cache_get(text_hash: str):
+    """LRU-чтение из глобального кэша спанов (по хэшу текста)."""
+    value = _GLOBAL_SPAN_CACHE.get(text_hash)
+    if value is not None:
+        _GLOBAL_SPAN_CACHE.move_to_end(text_hash)
+    return value
+
+
+def _global_span_cache_put(text_hash: str, spans) -> None:
+    """LRU-запись в глобальный кэш спанов."""
+    _GLOBAL_SPAN_CACHE[text_hash] = spans
+    _GLOBAL_SPAN_CACHE.move_to_end(text_hash)
+    while len(_GLOBAL_SPAN_CACHE) > CACHE_MAX_RECORDS:
+        _GLOBAL_SPAN_CACHE.popitem(last=False)
 
 
 class ProcessService:
@@ -255,7 +273,30 @@ system_name: str = "default"):
         """Основная логика: направление, идемпотентность, гонки.
 
         Возвращает (результат, список обнаруженных типов ПД, направление).
-"""
+        """
+        # Быстрый путь без блокировки (только для маскирования):
+        # если результат уже в кэше и payload не похож на маску — вернуть из кэша.
+        if "*" not in payload:
+            payload_hash = self._cache_key(payload)
+            cached = _cache_get(payload_hash)
+            if cached is not None:
+                masked, detected = cached
+                if self._should_mask(detected):
+                    # Создаём запись в SQLite (атомарно, без блокировки)
+                    now = time.time()
+                    new_record = {
+                        "payload_id": payload_id,
+                        "original_text": payload,
+                        "original_hash": _sha256(payload),
+                        "masked_text": masked,
+                        "masked_hash": _sha256(masked),
+                        "detected_types": detected,
+                        "created_at": now,
+                        "expires_at": now + TTL_SECONDS,
+                    }
+                    await self._store.insert_if_absent(payload_id, new_record)
+                    return masked, detected, "mask"
+
         lock = await self._store.get_lock(payload_id)
         try:
             acquired = await asyncio.wait_for(lock.acquire(), timeout=LOCK_TIMEOUT)
@@ -282,6 +323,7 @@ system_name: str = "default"):
         if record is None:
             # Новый payload_id: маскируем, сохраняем, возвращаем маску
             payload_hash = self._cache_key(payload)
+            text_hash = _sha256(payload)
             mode = self._mask_mode()
             cached = _cache_get(payload_hash)
             if cached is not None:
@@ -289,11 +331,16 @@ system_name: str = "default"):
             else:
                 # Пробуем кэш спанов (учитывает систему и pii_types)
                 spans = _span_cache_get(payload_hash)
+                if spans is None:
+                    # Пробуем глобальный кэш спанов (по хэшу текста)
+                    spans = _global_span_cache_get(text_hash)
                 if spans is not None:
                     masked, detected = apply_spans(payload, spans, self._allowed_types(), mode)
                 else:
                     masked, detected = await self._run_mask(payload, mode)
-                    _span_cache_put(payload_hash, detect_spans(payload))
+                    spans = detect_spans(payload)
+                    _span_cache_put(payload_hash, spans)
+                    _global_span_cache_put(text_hash, spans)
                 _cache_put(payload_hash, (masked, detected))
             # Контекстное маскирование: если комбинация типов не найдена — не маскируем
             if not self._should_mask(detected):
