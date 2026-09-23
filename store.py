@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import queue
+import os
+import socket
 import sqlite3
 import threading
 import time
@@ -44,10 +45,11 @@ class SQLiteStore:
     """
 
     def __init__(self, db_path: str = "state.db", ttl: int = TTL_SECONDS,
-                 max_records: int = MAX_RECORDS):
+                 max_records: int = MAX_RECORDS, local_write: bool = False):
         self._db_path = db_path
         self._ttl = ttl
         self._max_records = max_records
+        self._local_write = local_write
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -57,13 +59,14 @@ class SQLiteStore:
         # Пул блокировок на payload_id (ограниченный, с хэшированием)
         self._locks: list[asyncio.Lock] = [asyncio.Lock() for _ in range(LOCK_POOL_SIZE)]
         self._cache: "OrderedDict[str, dict]" = OrderedDict()
-        # Очередь несохранённых записей + writer-поток (запись в SQLite сразу)
+        # Локальный кэш записей, отправленных в writer-процесс (для быстрого чтения)
         self._pending: "OrderedDict[str, dict]" = OrderedDict()
         self._pending_lock = threading.Lock()
-        self._write_queue: "queue.Queue" = queue.Queue()
-        self._writer_stop = threading.Event()
-        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
-        self._writer_thread.start()
+        # Сокет-клиент для отправки записей в общий writer-процесс
+        self._writer_host = os.environ.get("WRITER_HOST", "127.0.0.1")
+        self._writer_port = int(os.environ.get("WRITER_PORT", "8001"))
+        self._writer_sock = None
+        self._writer_sock_lock = threading.Lock()
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -92,57 +95,58 @@ class SQLiteStore:
             )
             self._conn.commit()
 
-    def _writer_loop(self) -> None:
-        """Writer-поток: читает записи из очереди и пишет в SQLite пачками.
+    def _send_to_writer(self, payload_id: str, record: dict) -> None:
+        """Отправляет запись в общий writer-процесс по сокету.
 
-        Записи попадают в SQLite сразу (через writer-поток), поэтому
-        доступны всем воркерам без ожидания сброса буфера.
+        При local_write=True пишет напрямую в SQLite (для selftest).
+        Переиспользует persistent-соединение для снижения накладных расходов.
         """
-        while not self._writer_stop.is_set():
+        if self._local_write:
+            self._write_local(payload_id, record)
+            return
+        msg = json.dumps({"type": "insert", "payload_id": payload_id, "record": record})
+        try:
+            with self._writer_sock_lock:
+                if self._writer_sock is None:
+                    self._writer_sock = socket.create_connection(
+                        (self._writer_host, self._writer_port), timeout=2.0
+                    )
+                self._writer_sock.sendall((msg + "\n").encode("utf-8"))
+        except Exception:  # noqa: BLE001
+            # При ошибке пересоздаём соединение
             try:
-                # Ждём запись в очереди (с таймаутом для проверки stop)
-                item = self._write_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            batch = [item]
-            # Собираем пачку записей
-            while len(batch) < FLUSH_THRESHOLD:
-                try:
-                    batch.append(self._write_queue.get_nowait())
-                except queue.Empty:
-                    break
-            self._write_batch(batch)
+                with self._writer_sock_lock:
+                    if self._writer_sock is not None:
+                        self._writer_sock.close()
+                        self._writer_sock = None
+            except Exception:  # noqa: BLE001
+                pass
 
-    def _write_batch(self, batch: list) -> None:
-        """Пишет пачку записей в SQLite одной транзакцией."""
+    def _write_local(self, payload_id: str, record: dict) -> None:
+        """Пишет запись напрямую в SQLite (для selftest)."""
         try:
             with self._io_lock:
-                self._conn.executemany(
+                self._conn.execute(
                     """
                     INSERT OR IGNORE INTO records
                     (payload_id, original_text, original_hash, masked_text,
                      masked_hash, detected_types, created_at, expires_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    [
-                        (
-                            pid,
-                            rec["original_text"],
-                            rec["original_hash"],
-                            rec["masked_text"],
-                            rec["masked_hash"],
-                            json.dumps(rec["detected_types"], ensure_ascii=False),
-                            rec["created_at"],
-                            rec["expires_at"],
-                        )
-                        for pid, rec in batch
-                    ],
+                    (
+                        payload_id,
+                        record["original_text"],
+                        record["original_hash"],
+                        record["masked_text"],
+                        record["masked_hash"],
+                        json.dumps(record["detected_types"], ensure_ascii=False),
+                        record["created_at"],
+                        record["expires_at"],
+                    ),
                 )
                 self._conn.commit()
         except Exception:  # noqa: BLE001
-            # При ошибке возвращаем записи в очередь для повторной попытки
-            for pid, rec in batch:
-                self._write_queue.put((pid, rec))
+            pass
 
     def flush_metrics(self, metrics: dict) -> None:
         """Сбрасывает in-memory метрики в SQLite (UPSERT, суммирование).
@@ -300,10 +304,10 @@ class SQLiteStore:
         await asyncio.to_thread(self._evict_if_needed)
 
     async def insert_if_absent(self, payload_id: str, record: dict) -> bool:
-        """Добавляет запись в очередь writer-потока (запись в SQLite сразу).
+        """Отправляет запись в общий writer-процесс по сокету.
 
         Возвращает True, если запись добавлена (создана).
-        Writer-поток пишет в SQLite пачками, записи доступны всем воркерам.
+        Writer-процесс пишет в SQLite пачками, записи доступны всем воркерам.
         """
         with self._pending_lock:
             if payload_id in self._pending:
@@ -312,14 +316,13 @@ class SQLiteStore:
                 return False
             self._pending[payload_id] = record
             self._cache_put(payload_id, record)
-        self._write_queue.put((payload_id, record))
+        await asyncio.to_thread(self._send_to_writer, payload_id, record)
         return True
 
     async def flush_pending(self) -> None:
-        """Сбрасывает очередь записей в SQLite (принудительно)."""
-        # Writer-поток уже пишет в SQLite; здесь ждём опустошения очереди
-        while not self._write_queue.empty():
-            await asyncio.sleep(0.01)
+        """Сбрасывает локальный кэш записей (записи уже отправлены в writer-процесс)."""
+        # Записи уже отправлены в writer-процесс по сокету; здесь ничего не делаем
+        pass
 
     async def get_lock(self, payload_id: str) -> asyncio.Lock:
         """Возвращает asyncio.Lock из пула (по хэшу payload_id).
@@ -331,8 +334,5 @@ class SQLiteStore:
         return self._locks[idx]
 
     def close(self) -> None:
-        # Останавливаем writer-поток и ждём его завершения
-        self._writer_stop.set()
-        self._writer_thread.join(timeout=2.0)
         with self._io_lock:
             self._conn.close()
