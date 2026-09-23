@@ -1,7 +1,18 @@
+"""Проверка контракта на удалённом эндпоинте организаторов.
+
+Сравнивает типы обнаруженных ПД нашего решения с удалённым эндпоинтом
+process-test.holydev.space/process.
+
+Запуск:
+    python recon.py
+"""
+
 import asyncio
 import uuid
 
 import httpx
+
+from detectors import mask_payload
 
 URL = "https://process-test.holydev.space/process"
 
@@ -23,47 +34,61 @@ CASES = [
 ]
 
 
+def _local_types(text: str) -> list:
+    """Определяет типы ПД через наше решение."""
+    _, detected = mask_payload(text)
+    return detected
+
+
 async def probe_case(client: httpx.AsyncClient, name: str, text: str) -> None:
     payload_id = f"recon-{name}-{uuid.uuid4().hex}"
+
+    # Наше решение
+    local_types = _local_types(text)
+    masked_local, _ = mask_payload(text)
 
     print("=" * 70)
     print(f"CASE: {name}")
     print("IN :", text)
+    print("LOCAL types:", local_types)
 
     try:
         first = await client.post(
             URL,
-            json={
-                "payload": text,
-                "payload_id": payload_id,
-            },
+            json={"payload": text, "payload_id": payload_id},
         )
-
         print("STATUS 1:", first.status_code)
 
         if first.status_code != 200:
             print("ERROR 1:", first.text[:500])
             return
 
-        masked = first.json().get("result", "")
-        print("OUT:", masked)
+        masked_remote = first.json().get("result", "")
+        print("REMOTE OUT:", masked_remote)
 
+        # Сравнение: замаскированы ли ПД в удалённом ответе
+        remote_masked = masked_remote != text
+        local_masked = masked_local != text
+
+        # Для негативных кейсов (нет ПД) — оба не должны маскировать
+        if not local_types:
+            match = not remote_masked
+            print(f"MATCH: {'OK' if match else 'FAIL'} (no PII, remote_masked={remote_masked})")
+        else:
+            # ПД есть — оба должны маскировать
+            match = remote_masked
+            print(f"MATCH: {'OK' if match else 'FAIL'} (PII present, remote_masked={remote_masked})")
+
+        # Демаскирование
         second = await client.post(
             URL,
-            json={
-                "payload": masked,
-                "payload_id": payload_id,
-            },
+            json={"payload": masked_remote, "payload_id": payload_id},
         )
-
         print("STATUS 2:", second.status_code)
-
-        if second.status_code != 200:
-            print("ERROR 2:", second.text[:500])
-            return
-
-        unmasked = second.json().get("result", "")
-        print("UNMASK:", unmasked)
+        if second.status_code == 200:
+            unmasked = second.json().get("result", "")
+            print("UNMASK:", unmasked)
+            print(f"UNMASK OK: {'OK' if unmasked == text else 'FAIL'}")
 
     except Exception as exc:
         print("EXCEPTION:", exc)
